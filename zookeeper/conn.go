@@ -2,7 +2,7 @@
 package zookeeper
 
 import (
-	"nexus/internal/pkg/logger"
+	"github.com/wangyingjie930/nexus-pkg/logger"
 	"time"
 
 	"github.com/go-zookeeper/zk"

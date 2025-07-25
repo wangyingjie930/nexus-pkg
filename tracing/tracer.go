@@ -3,8 +3,8 @@ package tracing
 
 import (
 	"context"
+	"github.com/wangyingjie930/nexus-pkg/logger"
 	"go.opentelemetry.io/otel/trace"
-	"nexus/internal/pkg/logger"
 	"time"
 
 	"go.opentelemetry.io/otel"

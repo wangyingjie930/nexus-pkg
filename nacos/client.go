@@ -7,7 +7,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
-	"nexus/internal/pkg/logger"
+	"github.com/wangyingjie930/nexus-pkg/logger"
 )
 
 // Client 封装了 Nacos 命名客户端

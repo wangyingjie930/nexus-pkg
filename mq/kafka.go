@@ -3,7 +3,7 @@ package mq
 
 import (
 	"context"
-	"nexus/internal/pkg/logger"
+	"github.com/wangyingjie930/nexus-pkg/logger"
 	"time"
 
 	"github.com/segmentio/kafka-go"

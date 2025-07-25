@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/redis/go-redis/v9"
-	"nexus/internal/pkg/logger"
+	"github.com/wangyingjie930/nexus-pkg/logger"
 	"strings"
 	"sync"
 	"time"
