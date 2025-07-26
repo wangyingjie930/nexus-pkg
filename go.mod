@@ -1,6 +1,6 @@
 module github.com/wangyingjie930/nexus-pkg
 
-go 1.24.5
+go 1.24.0
 
 require (
 	github.com/go-zookeeper/zk v1.0.4
