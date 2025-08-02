@@ -6,6 +6,7 @@ package transactional_test
 import (
 	"context"
 	"fmt"
+	"github.com/wangyingjie930/nexus-pkg/transactional"
 	"os"
 	"strings"
 	"testing"
@@ -14,14 +15,13 @@ import (
 	"github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wangyingjie930/nexus-pkg/transactional_message"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 var (
 	db     *gorm.DB
-	store  transactional_message.Store
+	store  transactional.Store
 	writer *kafka.Writer
 )
 
@@ -45,13 +45,12 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to connect to MySQL: %v", err))
 	}
-	store = transactional_message.NewGormStore(db)
+	store = transactional.NewGormStore(db)
 
 	// 初始化 Kafka Writer
 	writer = kafka.NewWriter(kafka.WriterConfig{
-		Brokers:      strings.Split(kafkaBrokers, ","),
-		BatchSize:    1, // 测试时设为1，确保立即发送
-		RequiredAcks: kafka.RequireAll,
+		Brokers:   strings.Split(kafkaBrokers, ","),
+		BatchSize: 1, // 测试时设为1，确保立即发送
 	})
 
 	// 运行包中的所有测试
@@ -72,9 +71,11 @@ func TestTransactionalOutbox_EndToEnd(t *testing.T) {
 	testKey := "order_123"
 	testPayload := []byte(`{"message": "this is an end-to-end test"}`)
 
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+
 	// 创建 Kafka Reader 来消费消息进行验证
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  writer.Stats().Brokers,
+		Brokers:  strings.Split(kafkaBrokers, ","),
 		Topic:    testTopic,
 		GroupID:  "test-verifier",
 		MinBytes: 1,
@@ -88,10 +89,10 @@ func TestTransactionalOutbox_EndToEnd(t *testing.T) {
 	require.NoError(t, db.Exec("DELETE FROM transactional_messages").Error)
 
 	// --- 核心测试逻辑 ---
-	txService := transactional_message.NewService(store, writer)
+	txService := transactional.NewService(store, writer)
 
 	// 1. 在事务中保存消息
-	var savedMsg transactional_message.Message
+	var savedMsg transactional.Message
 	err := db.Transaction(func(tx *gorm.DB) error {
 		return txService.SendInTx(ctx, tx, testTopic, testKey, testPayload)
 	})
@@ -100,7 +101,7 @@ func TestTransactionalOutbox_EndToEnd(t *testing.T) {
 	// 2. 验证消息已存入数据库，状态为 PENDING
 	err = db.Where("topic = ?", testTopic).First(&savedMsg).Error
 	require.NoError(t, err)
-	assert.Equal(t, transactional_message.StatusPending, savedMsg.Status)
+	assert.Equal(t, transactional.StatusPending, savedMsg.Status)
 	assert.Equal(t, testPayload, savedMsg.Payload)
 
 	// 3. 运行转发器逻辑
@@ -116,8 +117,8 @@ func TestTransactionalOutbox_EndToEnd(t *testing.T) {
 	assert.Equal(t, testPayload, msg.Value)
 
 	// 5. 验证数据库中的消息状态已更新为 SENT
-	var finalMsg transactional_message.Message
+	var finalMsg transactional.Message
 	err = db.Where("id = ?", savedMsg.ID).First(&finalMsg).Error
 	require.NoError(t, err)
-	assert.Equal(t, transactional_message.StatusSent, finalMsg.Status)
+	assert.Equal(t, transactional.StatusSent, finalMsg.Status)
 }
