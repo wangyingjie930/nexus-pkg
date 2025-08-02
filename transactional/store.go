@@ -9,7 +9,7 @@ import (
 // Store 定义了对事务消息表的操作接口
 type Store interface {
 	// CreateInTx 在一个给定的数据库事务中创建一条消息记录
-	CreateInTx(ctx context.Context, tx *gorm.DB, msg *Message) error
+	CreateInTx(ctx context.Context, msg *Message) error
 	// FindPendingMessages 查找一定数量的待发送消息
 	FindPendingMessages(ctx context.Context, limit int) ([]*Message, error)
 	// UpdateStatus 更新消息的状态和重试次数
@@ -33,8 +33,8 @@ func NewGormStore(db *gorm.DB) Store {
 	return &gormStore{db: db}
 }
 
-func (s *gormStore) CreateInTx(ctx context.Context, tx *gorm.DB, msg *Message) error {
-	return tx.WithContext(ctx).Create(msg).Error
+func (s *gormStore) CreateInTx(ctx context.Context, msg *Message) error {
+	return s.db.WithContext(ctx).Create(msg).Error
 }
 
 func (s *gormStore) FindPendingMessages(ctx context.Context, limit int) ([]*Message, error) {

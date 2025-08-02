@@ -6,7 +6,6 @@ import (
 	"github.com/wangyingjie930/nexus-pkg/logger"
 	"github.com/wangyingjie930/nexus-pkg/mq"
 	"go.opentelemetry.io/otel"
-	"gorm.io/gorm"
 )
 
 // Service 封装了事务性消息的核心逻辑
@@ -25,7 +24,7 @@ func NewService(store Store, writer *kafka.Writer) *Service {
 
 // SendInTx 在业务事务中保存待发送的消息。
 // 这是给业务代码调用的核心方法。
-func (s *Service) SendInTx(ctx context.Context, tx *gorm.DB, topic, key string, payload []byte) error {
+func (s *Service) SendInTx(ctx context.Context, topic, key string, payload []byte) error {
 	msg := &Message{
 		Topic:   topic,
 		Key:     key,
@@ -34,7 +33,7 @@ func (s *Service) SendInTx(ctx context.Context, tx *gorm.DB, topic, key string, 
 	}
 
 	// 将消息的创建操作包含在业务方的DB事务中
-	return s.store.CreateInTx(ctx, tx, msg)
+	return s.store.CreateInTx(ctx, msg)
 }
 
 // ForwardPendingMessages 查找并转发待处理的消息
