@@ -1,0 +1,47 @@
+# .github/workflows/integration-test.yml
+
+name: Nexus-Pkg Integration Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Start services (MySQL & Kafka)
+        run: docker-compose up -d
+
+      # 关键步骤：等待服务完全就绪
+      # 虽然 docker-compose healthcheck 有帮助，但在 CI 中增加显式等待更可靠
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for MySQL and Kafka to be ready..."
+          # 这里可以使用更复杂的工具如 dockerize，但 sleep 对于简单场景足够
+          sleep 30
+
+      - name: Run Integration Tests
+        # 通过环境变量将连接信息传递给 Go 测试程序
+        env:
+          MYSQL_DSN: "root:testpassword@tcp(127.0.0.1:3306)/nexus_test?charset=utf8mb4&parseTime=True&loc=Local"
+          KAFKA_BROKERS: "localhost:9092"
+        # 使用 -tags integration 来只运行集成测试
+        run: go test -v -race -tags=integration ./...
+
+      # 无论测试成功与否，最后都要清理环境
+      - name: Stop services
+        if: always()
+        run: docker-compose down
