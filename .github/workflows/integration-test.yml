@@ -23,7 +23,8 @@ jobs:
           cache: true
 
       - name: Start services (MySQL & Kafka)
-        run: docker-compose up -d
+        # 核心修改点：使用 "docker compose" 替代 "docker-compose"
+        run: docker compose up -d
 
       # 关键步骤：等待服务完全就绪
       # 虽然 docker-compose healthcheck 有帮助，但在 CI 中增加显式等待更可靠
@@ -44,4 +45,5 @@ jobs:
       # 无论测试成功与否，最后都要清理环境
       - name: Stop services
         if: always()
-        run: docker-compose down
+        # 核心修改点：使用 "docker compose" 替代 "docker-compose"
+        run: docker compose down
