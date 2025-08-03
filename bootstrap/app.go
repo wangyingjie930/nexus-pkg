@@ -29,41 +29,54 @@ type AppInfo struct {
 
 // StartService 封装了所有微服务的通用启动和优雅关停逻辑。
 func StartService(info AppInfo) {
+	// 首先，初始化配置（它会决定是否使用本地文件模式）
+	Init()
 	logger.Init(info.ServiceName)
 
-	serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
-	if err != nil {
-		logger.Logger.Fatal().Msgf("FATAL: Invalid Nacos server address format: %v", err)
-	}
-	clientConfig := createNacosClientConfig(nacosNamespace)
+	var namingClient *nacos.Client
+	var err error
 
-	// 2. 初始化核心组件
-	// a. Tracer
+	// 检查是否处于本地模式（通过配置路径判断）
+	isLocalMode := getEnv("NEXUS_CONFIG_PATH", "") != ""
+
+	if !isLocalMode {
+		logger.Logger.Info().Msg("Nacos integration is enabled.")
+		serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
+		if err != nil {
+			logger.Logger.Fatal().Msgf("FATAL: Invalid Nacos server address format: %v", err)
+		}
+		clientConfig := createNacosClientConfig(nacosNamespace)
+		namingClient, err = nacos.NewNacosClientWithConfigs(serverConfigs, &clientConfig, nacosGroup)
+		if err != nil {
+			logger.Logger.Fatal().Msgf("failed to initialize nacos client: %v", err)
+		}
+	} else {
+		logger.Logger.Info().Msg("Nacos integration is disabled (local mode).")
+	}
+
+	// 初始化 Tracer
 	tp, err := tracing.InitTracerProvider(info.ServiceName, GetCurrentConfig().Infra.Jaeger.Endpoint)
 	if err != nil {
 		logger.Logger.Fatal().Msgf("failed to initialize tracer provider: %v", err)
 	}
 
-	namingClient, err := nacos.NewNacosClientWithConfigs(serverConfigs, &clientConfig, nacosGroup)
-	if err != nil {
-		logger.Logger.Fatal().Msgf("failed to initialize nacos client: %v", err)
+	// 只有在非本地模式下才获取IP并注册服务
+	var ip string
+	if !isLocalMode && namingClient != nil {
+		ip, err = utils.GetOutboundIP()
+		if err != nil {
+			logger.Logger.Fatal().Msgf("failed to get outbound IP address: %v", err)
+		}
+		err = namingClient.RegisterServiceInstance(info.ServiceName, ip, info.Port)
+		if err != nil {
+			logger.Logger.Fatal().Msgf("failed to register service with nacos: %v", err)
+		}
 	}
 
-	// 3. 获取本机 IP 用于注册
-	ip, err := utils.GetOutboundIP()
-	if err != nil {
-		logger.Logger.Fatal().Msgf("failed to get outbound IP address: %v", err)
-	}
-
-	// 4. 执行服务注册
-	err = namingClient.RegisterServiceInstance(info.ServiceName, ip, info.Port)
-	if err != nil {
-		logger.Logger.Fatal().Msgf("failed to register service with nacos: %v", err)
-	}
-
-	// 5. 创建并启动 HTTP Server
+	// 创建并启动 HTTP Server
 	mux := http.NewServeMux()
 	if info.RegisterHandlers != nil {
+		// 即使Nacos为nil，也要将它传递下去，让业务代码决定如何处理
 		info.RegisterHandlers(AppCtx{Mux: mux, Nacos: namingClient})
 	}
 	server := &http.Server{Addr: ":" + strconv.Itoa(info.Port), Handler: mux}
@@ -74,38 +87,36 @@ func StartService(info AppInfo) {
 		}
 	}()
 
-	// 6. 优雅关停
+	// 优雅关停
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// 阻塞主 goroutine，直到接收到退出信号
 	<-quit
 	logger.Logger.Printf("Shutting down service %s...", info.ServiceName)
 
-	// 创建一个有超时的 context，用于关停流程
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 8. 在关停流程中，按顺序执行清理操作 (后进先出)
-	// a. 从 Nacos 注销服务
-	if err := namingClient.DeregisterServiceInstance(info.ServiceName, ip, info.Port); err != nil {
-		logger.Logger.Printf("Error deregistering from Nacos: %v", err)
-	} else {
-		logger.Logger.Printf("Service %s deregistered from Nacos.", info.ServiceName)
+	// 只有在非本地模式下才执行注销和关闭客户端
+	if !isLocalMode && namingClient != nil {
+		if err := namingClient.DeregisterServiceInstance(info.ServiceName, ip, info.Port); err != nil {
+			logger.Logger.Printf("Error deregistering from Nacos: %v", err)
+		} else {
+			logger.Logger.Printf("Service %s deregistered from Nacos.", info.ServiceName)
+		}
+		if nacosConfigClient != nil {
+			nacosConfigClient.CloseClient()
+		}
 	}
 
-	if nacosConfigClient != nil {
-		nacosConfigClient.CloseClient()
-	}
-
-	// b. 关闭 Tracer Provider，确保所有缓冲的 trace 都被发送出去
+	// 关闭 Tracer Provider
 	if err := tp.Shutdown(ctx); err != nil {
 		logger.Logger.Printf("Error shutting down tracer provider: %v", err)
 	} else {
 		logger.Logger.Printf("Tracer provider shut down.")
 	}
 
-	// c. 关闭 HTTP 服务器
+	// 关闭 HTTP Server
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Logger.Printf("Error shutting down http server: %v", err)
 	} else {
