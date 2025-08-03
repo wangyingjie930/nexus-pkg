@@ -2,16 +2,17 @@ package bootstrap
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+
 	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
 	"github.com/wangyingjie930/nexus-pkg/logger"
 	"gopkg.in/yaml.v3"
-	"os"
-	"strconv"
-	"strings"
-	"sync"
 )
 
 type InfraConfig struct {
@@ -59,6 +60,12 @@ type ConsumerResilienceConfig struct {
 	RetryableExceptions []string `yaml:"retryableExceptions"`
 }
 
+// CombinedConfig 是一个临时结构体，用于从单个文件中加载所有配置
+type CombinedConfig struct {
+	Infra InfraConfig `yaml:"infra"`
+	App   AppConfig   `yaml:"app"`
+}
+
 // Config 是整个应用唯一的全局配置入口
 type Config struct {
 	Infra InfraConfig
@@ -78,10 +85,55 @@ var (
 	nacosGroup       string
 )
 
-// Init 是应用启动的第一步，负责加载所有配置
+// Init 是应用启动的第一步，负责加载所有配置。
+// 它支持优先从本地文件加载(通过 NEXUS_CONFIG_PATH 环境变量),
+// 如果文件路径未提供，则回退到 Nacos。
 func Init() {
 	logger.Init("bootstrap")
 
+	// 优先尝试从本地文件加载
+	configPath := getEnv("NEXUS_CONFIG_PATH", "")
+	if configPath != "" {
+		logger.Logger.Info().Msgf("Attempting to load configuration from file: %s", configPath)
+		if err := loadConfigFromFile(configPath); err == nil {
+			logger.Logger.Info().Msg("✅ Configuration loaded successfully from file.")
+			return // 从文件成功加载，跳过 Nacos
+		} else {
+			logger.Logger.Warn().Err(err).Msgf("⚠️ Failed to load configuration from file, falling back to Nacos...")
+		}
+	}
+
+	// 回退到 Nacos
+	logger.Logger.Info().Msg("Loading configuration from Nacos...")
+	initFromNacos()
+}
+
+// loadConfigFromFile 从单个 YAML 文件加载整个配置。
+// 这对于本地开发或没有 Nacos 的环境非常有用。
+func loadConfigFromFile(filePath string) error {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file %s: %w", filePath, err)
+	}
+
+	configLock.Lock()
+	defer configLock.Unlock()
+
+	var combinedConfig CombinedConfig
+	if err := yaml.Unmarshal(content, &combinedConfig); err != nil {
+		return fmt.Errorf("failed to unmarshal config file: %w", err)
+	}
+
+	// 从组合结构体填充全局配置
+	GlobalConfig.Infra = combinedConfig.Infra
+	GlobalConfig.App = combinedConfig.App
+
+	logger.Logger.Info().Any("GlobalConfig", GlobalConfig).Msg("✅ Bootstrap: Configuration loaded from file.")
+	return nil
+}
+
+// initFromNacos 从 Nacos 初始化配置。
+func initFromNacos() {
 	// 1. 获取最基础的引导配置 (Nacos地址)
 	nacosServerAddrs = getEnv("NACOS_SERVER_ADDRS", "localhost:8848")
 	nacosNamespace = getEnv("NACOS_NAMESPACE", "")
@@ -111,7 +163,7 @@ func Init() {
 	// b. 应用业务配置
 	initAndWatchSingleConfig("nexus-app.yaml", nacosGroup, &GlobalConfig.App)
 
-	logger.Logger.Info().Any("GlobalConfig", GlobalConfig).Msg("✅ Bootstrap Phase 1: All configurations loaded and watched successfully.")
+	logger.Logger.Info().Any("GlobalConfig", GlobalConfig).Msg("✅ Bootstrap Phase 1: All configurations loaded and watched successfully from Nacos.")
 }
 
 // GetCurrentConfig 返回一个线程安全的配置副本
