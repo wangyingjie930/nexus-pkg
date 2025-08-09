@@ -15,6 +15,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config 是一个接口，定义了框架所需的最小配置集。
+// 使用者可以通过在自己的配置结构体中嵌入 BaseConfig 来轻松实现此接口。
+type Config interface {
+	GetInfra() *InfraConfig
+	GetApp() *AppConfig
+}
+
 type InfraConfig struct {
 	Kafka struct {
 		Brokers string `yaml:"brokers"`
@@ -60,147 +67,142 @@ type ConsumerResilienceConfig struct {
 	RetryableExceptions []string `yaml:"retryableExceptions"`
 }
 
-// CombinedConfig 是一个临时结构体，用于从单个文件中加载所有配置
-type CombinedConfig struct {
+// BaseConfig 是一个基础配置结构体，提供了框架所需的基本字段。
+// 使用者应该将此结构体嵌入到他们自己的自定义配置结构体中。
+type BaseConfig struct {
 	Infra InfraConfig `yaml:"infra"`
 	App   AppConfig   `yaml:"app"`
 }
 
-// Config 是整个应用唯一的全局配置入口
-type Config struct {
-	Infra InfraConfig
-	App   AppConfig
+// GetInfra 实现了 Config 接口
+func (c *BaseConfig) GetInfra() *InfraConfig {
+	return &c.Infra
 }
 
-var (
-	// 全局配置实例
-	GlobalConfig = new(Config)
-	// 用于保护全局配置的读写
-	configLock = new(sync.RWMutex)
-	// Nacos 配置客户端，在Init中创建，在StartService的优雅关停中关闭
-	nacosConfigClient config_client.IConfigClient
+// GetApp 实现了 Config 接口
+func (c *BaseConfig) GetApp() *AppConfig {
+	return &c.App
+}
 
-	nacosServerAddrs string
-	nacosNamespace   string
-	nacosGroup       string
-)
-
-// Init 是应用启动的第一步，负责加载所有配置。
-// 它支持优先从本地文件加载(通过 NEXUS_CONFIG_PATH 环境变量),
-// 如果文件路径未提供，则回退到 Nacos。
-func Init() {
+// Load 是应用启动时加载配置的新入口。
+// 它取代了旧的全局 Init() 函数。
+// configHolder 必须是一个指针，指向一个嵌入了 BaseConfig 的自定义结构体。
+func Load(configHolder interface{}) (config_client.IConfigClient, error) {
 	logger.Init("bootstrap")
 
 	// 优先尝试从本地文件加载
 	configPath := getEnv("NEXUS_CONFIG_PATH", "")
 	if configPath != "" {
 		logger.Logger.Info().Msgf("Attempting to load configuration from file: %s", configPath)
-		if err := loadConfigFromFile(configPath); err == nil {
+		err := loadConfigFromFile(configPath, configHolder)
+		if err == nil {
 			logger.Logger.Info().Msg("✅ Configuration loaded successfully from file.")
-			return // 从文件成功加载，跳过 Nacos
+			return nil, nil // 从文件加载时，不返回 Nacos 客户端
 		} else {
 			logger.Logger.Warn().Err(err).Msgf("⚠️ Failed to load configuration from file, falling back to Nacos...")
+			return nil, err
 		}
 	}
 
 	// 回退到 Nacos
 	logger.Logger.Info().Msg("Loading configuration from Nacos...")
-	initFromNacos()
+	return initFromNacos(configHolder)
 }
 
 // loadConfigFromFile 从单个 YAML 文件加载整个配置。
-// 这对于本地开发或没有 Nacos 的环境非常有用。
-func loadConfigFromFile(filePath string) error {
+func loadConfigFromFile(filePath string, configHolder interface{}) error {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read config file %s: %w", filePath, err)
 	}
 
-	configLock.Lock()
-	defer configLock.Unlock()
-
-	var combinedConfig CombinedConfig
-	if err := yaml.Unmarshal(content, &combinedConfig); err != nil {
+	if err := yaml.Unmarshal(content, configHolder); err != nil {
 		return fmt.Errorf("failed to unmarshal config file: %w", err)
 	}
 
-	// 从组合结构体填充全局配置
-	GlobalConfig.Infra = combinedConfig.Infra
-	GlobalConfig.App = combinedConfig.App
-
-	logger.Logger.Info().Any("GlobalConfig", GlobalConfig).Msg("✅ Bootstrap: Configuration loaded from file.")
+	logger.Logger.Info().Any("config", configHolder).Msg("✅ Bootstrap: Configuration loaded from file.")
 	return nil
 }
 
 // initFromNacos 从 Nacos 初始化配置。
-func initFromNacos() {
-	// 1. 获取最基础的引导配置 (Nacos地址)
-	nacosServerAddrs = getEnv("NACOS_SERVER_ADDRS", "localhost:8848")
-	nacosNamespace = getEnv("NACOS_NAMESPACE", "")
-	nacosGroup = getEnv("NACOS_GROUP", "DEFAULT_GROUP")
+func initFromNacos(configHolder interface{}) (config_client.IConfigClient, error) {
+	// 确保 configHolder 实现了 Config 接口，否则无法进行后续操作
+	cfg, ok := configHolder.(Config)
+	if !ok {
+		return nil, fmt.Errorf("configHolder must implement the bootstrap.Config interface")
+	}
+
+	// 1. 获取 Nacos 连接配置
+	nacosServerAddrs := getEnv("NACOS_SERVER_ADDRS", "localhost:8848")
+	nacosNamespace := getEnv("NACOS_NAMESPACE", "")
+	nacosGroup := getEnv("NACOS_GROUP", "DEFAULT_GROUP")
 
 	// 2. 创建 Nacos 客户端配置
 	serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
 	if err != nil {
-		logger.Logger.Fatal().Msgf("FATAL: Invalid Nacos server address format: %v", err)
+		return nil, fmt.Errorf("invalid Nacos server address format: %w", err)
 	}
 	clientConfig := createNacosClientConfig(nacosNamespace)
 
 	// 3. 创建 Nacos 配置客户端
-	nacosConfigClient, err = clients.NewConfigClient(
+	nacosClient, err := clients.NewConfigClient(
 		vo.NacosClientParam{
 			ClientConfig:  &clientConfig,
 			ServerConfigs: serverConfigs,
 		},
 	)
 	if err != nil {
-		logger.Logger.Fatal().Msgf("FATAL: Failed to create Nacos config client: %v", err)
+		return nil, fmt.Errorf("failed to create Nacos config client: %w", err)
 	}
 
+	// 使用一个锁来确保并发更新的安全性
+	var lock sync.RWMutex
+
 	// 4. 拉取并监听两个配置文件
-	// a. 基础设施配置
-	initAndWatchSingleConfig("nexus-infra.yaml", nacosGroup, &GlobalConfig.Infra)
-	// b. 应用业务配置
-	initAndWatchSingleConfig("nexus-app.yaml", nacosGroup, &GlobalConfig.App)
+	// a. 基础设施配置 (指向 BaseConfig.Infra)
+	err = initAndWatchSingleConfig(nacosClient, "nexus-infra.yaml", nacosGroup, cfg.GetInfra(), &lock)
+	if err != nil {
+		return nacosClient, err
+	}
+	// b. 应用业务配置 (指向 BaseConfig.App)
+	err = initAndWatchSingleConfig(nacosClient, "nexus-app.yaml", nacosGroup, cfg.GetApp(), &lock)
+	if err != nil {
+		return nacosClient, err
+	}
 
-	logger.Logger.Info().Any("GlobalConfig", GlobalConfig).Msg("✅ Bootstrap Phase 1: All configurations loaded and watched successfully from Nacos.")
-}
-
-// GetCurrentConfig 返回一个线程安全的配置副本
-func GetCurrentConfig() Config {
-	configLock.RLock()
-	defer configLock.RUnlock()
-	return *GlobalConfig
+	logger.Logger.Info().Any("config", configHolder).Msg("✅ Bootstrap: All configurations loaded and watched successfully from Nacos.")
+	return nacosClient, nil
 }
 
 // initAndWatchSingleConfig 是一个通用函数，用于拉取、解析和监听单个配置文件
-func initAndWatchSingleConfig(dataId, group string, configPtr interface{}) {
-	content, err := nacosConfigClient.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
+func initAndWatchSingleConfig(client config_client.IConfigClient, dataId, group string, configPtr interface{}, lock *sync.RWMutex) error {
+	content, err := client.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
 	if err != nil {
-		logger.Logger.Fatal().Msgf("FATAL: Failed to get initial config for DataId '%s': %v", dataId, err)
+		return fmt.Errorf("failed to get initial config for DataId '%s': %w", dataId, err)
 	}
 
-	updateConfig(content, configPtr) // 加载初始配置
+	updateConfig(content, configPtr, lock) // 加载初始配置
 
-	err = nacosConfigClient.ListenConfig(vo.ConfigParam{
+	err = client.ListenConfig(vo.ConfigParam{
 		DataId: dataId,
 		Group:  group,
 		OnChange: func(_, _, _, data string) {
-			logger.Logger.Printf("🔔 Nacos config changed for DataId: %s. Applying new config...", dataId)
-			updateConfig(data, configPtr)
+			logger.Logger.Info().Msgf("🔔 Nacos config changed for DataId: %s. Applying new config...", dataId)
+			updateConfig(data, configPtr, lock)
 		},
 	})
 	if err != nil {
-		logger.Logger.Fatal().Msgf("FATAL: Failed to listen config for DataId '%s': %v", dataId, err)
+		return fmt.Errorf("failed to listen config for DataId '%s': %w", dataId, err)
 	}
+	return nil
 }
 
 // updateConfig 线程安全地更新配置
-func updateConfig(content string, configPtr interface{}) {
-	configLock.Lock()
-	defer configLock.Unlock()
+func updateConfig(content string, configPtr interface{}, lock *sync.RWMutex) {
+	lock.Lock()
+	defer lock.Unlock()
 	if err := yaml.Unmarshal([]byte(content), configPtr); err != nil {
-		logger.Logger.Printf("❌ ERROR: Failed to unmarshal Nacos config: %v", err)
+		logger.Logger.Error().Err(err).Msg("❌ ERROR: Failed to unmarshal Nacos config")
 	}
 }
 

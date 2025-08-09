@@ -3,6 +3,7 @@ package bootstrap
 
 import (
 	"context"
+	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/wangyingjie930/nexus-pkg/logger"
 	"github.com/wangyingjie930/nexus-pkg/nacos"
 	"github.com/wangyingjie930/nexus-pkg/tracing"
@@ -28,19 +29,23 @@ type AppInfo struct {
 }
 
 // StartService 封装了所有微服务的通用启动和优雅关停逻辑。
-func StartService(info AppInfo) {
-	// 首先，初始化配置（它会决定是否使用本地文件模式）
-	Init()
+// 调用者现在必须先调用 Load() 来加载配置，然后将配置实例和 Nacos 客户端（如果存在）传入。
+func StartService(info AppInfo, cfg Config, nacosConfigClient config_client.IConfigClient) {
 	logger.Init(info.ServiceName)
 
 	var namingClient *nacos.Client
 	var err error
 
-	// 检查是否处于本地模式（通过配置路径判断）
-	isLocalMode := getEnv("NEXUS_CONFIG_PATH", "") != ""
+	// 检查是否处于 Nacos 模式 (通过 nacosConfigClient 是否为 nil 判断)
+	isNacosMode := nacosConfigClient != nil
 
-	if !isLocalMode {
+	if isNacosMode {
 		logger.Logger.Info().Msg("Nacos integration is enabled.")
+		// 从环境中读取 Nacos 连接信息来创建 Naming 客户端
+		nacosServerAddrs := getEnv("NACOS_SERVER_ADDRS", "localhost:8848")
+		nacosNamespace := getEnv("NACOS_NAMESPACE", "")
+		nacosGroup := getEnv("NACOS_GROUP", "DEFAULT_GROUP")
+
 		serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
 		if err != nil {
 			logger.Logger.Fatal().Msgf("FATAL: Invalid Nacos server address format: %v", err)
@@ -55,14 +60,14 @@ func StartService(info AppInfo) {
 	}
 
 	// 初始化 Tracer
-	tp, err := tracing.InitTracerProvider(info.ServiceName, GetCurrentConfig().Infra.Jaeger.Endpoint)
+	tp, err := tracing.InitTracerProvider(info.ServiceName, cfg.GetInfra().Jaeger.Endpoint)
 	if err != nil {
 		logger.Logger.Fatal().Msgf("failed to initialize tracer provider: %v", err)
 	}
 
-	// 只有在非本地模式下才获取IP并注册服务
+	// 只有在 Nacos 模式下才获取IP并注册服务
 	var ip string
-	if !isLocalMode && namingClient != nil {
+	if isNacosMode && namingClient != nil {
 		ip, err = utils.GetOutboundIP()
 		if err != nil {
 			logger.Logger.Fatal().Msgf("failed to get outbound IP address: %v", err)
@@ -97,15 +102,16 @@ func StartService(info AppInfo) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 只有在非本地模式下才执行注销和关闭客户端
-	if !isLocalMode && namingClient != nil {
+	// 只有在 Nacos 模式下才执行注销和关闭客户端
+	if isNacosMode && namingClient != nil {
 		if err := namingClient.DeregisterServiceInstance(info.ServiceName, ip, info.Port); err != nil {
 			logger.Logger.Printf("Error deregistering from Nacos: %v", err)
 		} else {
 			logger.Logger.Printf("Service %s deregistered from Nacos.", info.ServiceName)
 		}
+		// 关闭由 Load() 函数创建并传入的 Nacos Config Client
 		if nacosConfigClient != nil {
-			nacosConfigClient.CloseClient()
+			nacosConfigClient.Close()
 		}
 	}
 

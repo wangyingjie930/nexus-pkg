@@ -56,35 +56,42 @@ type Application struct {
 }
 
 // NewApplication 是应用的构造函数，负责完成所有组件的初始化、组装和注册。
-func NewApplication[T any](info AppInfoV2[T]) (*Application, error) {
-	// 1. 初始化最底层的配置，并获取 Nacos Config Client
-	Init()
-
-	// 1.1 初始化日志
+// 调用者现在必须先调用 Load() 来加载配置，然后将配置实例和 Nacos 客户端（如果存在）传入。
+func NewApplication[T any](info AppInfoV2[T], cfg Config, nacosConfigClient config_client.IConfigClient) (*Application, error) {
+	// 1. 初始化日志
 	logger.Init(info.ServiceName)
 
 	// 2. 初始化 Tracer Provider
-	tp, err := tracing.InitTracerProvider(info.ServiceName, GetCurrentConfig().Infra.Jaeger.Endpoint)
+	tp, err := tracing.InitTracerProvider(info.ServiceName, cfg.GetInfra().Jaeger.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init tracer: %w", err)
 	}
 
-	serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
-	if err != nil {
-		logger.Logger.Fatal().Err(err).Msgf("FATAL: Invalid Nacos server address")
-	}
-	clientConfig := createNacosClientConfig(nacosNamespace)
+	// 3. 初始化 Nacos Naming 客户端 (如果需要)
+	var namingClient *nacos.Client
+	isNacosMode := nacosConfigClient != nil
+	if isNacosMode {
+		nacosServerAddrs := getEnv("NACOS_SERVER_ADDRS", "localhost:8848")
+		nacosNamespace := getEnv("NACOS_NAMESPACE", "")
+		nacosGroup := getEnv("NACOS_GROUP", "DEFAULT_GROUP")
 
-	namingClient, err := nacos.NewNacosClientWithConfigs(serverConfigs, &clientConfig, nacosGroup)
-	if err != nil {
-		logger.Logger.Fatal().Err(err).Msgf("failed to initialize nacos client: %v", err)
+		serverConfigs, err := createNacosServerConfigs(nacosServerAddrs)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Nacos server address: %w", err)
+		}
+		clientConfig := createNacosClientConfig(nacosNamespace)
+
+		namingClient, err = nacos.NewNacosClientWithConfigs(serverConfigs, &clientConfig, nacosGroup)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize nacos naming client: %w", err)
+		}
 	}
 
 	// 4. 创建 Application 实例
 	app := &Application{
 		info:        info,
 		serviceName: info.ServiceName,
-		nacosConfig: nacosConfigClient,
+		nacosConfig: nacosConfigClient, // 保存 Nacos Config 客户端
 		nacosNaming: namingClient,
 		tracer:      tp,
 	}
@@ -124,16 +131,18 @@ func (app *Application) AddServer(mux *http.ServeMux, port int) error {
 		Handler: mux,
 	}
 
-	// 启动 HTTP 服务器前，先向 Nacos 注册
-	logger.Logger.Printf("Registering service '%s' to Nacos...", serviceName)
-	if err := app.nacosNaming.RegisterServiceInstance(serviceName, ip, port); err != nil {
-		return fmt.Errorf("failed to register '%s' with nacos: %w", serviceName, err)
+	// 启动 HTTP 服务器前，先向 Nacos 注册 (如果 Nacos 启用)
+	if app.nacosNaming != nil {
+		logger.Logger.Info().Msgf("Registering service '%s' to Nacos...", serviceName)
+		if err := app.nacosNaming.RegisterServiceInstance(serviceName, ip, port); err != nil {
+			return fmt.Errorf("failed to register '%s' with nacos: %w", serviceName, err)
+		}
+		logger.Logger.Info().Msgf("✅ Service '%s' registered to Nacos successfully (%s:%d)", serviceName, ip, port)
 	}
-	logger.Logger.Printf("✅ Service '%s' registered to Nacos successfully (%s:%d)", serviceName, ip, port)
 
 	// 将 HTTP 服务器的启动和关闭纳入 errgroup 的管理
 	app.g.Go(func() error {
-		logger.Logger.Printf("✅ HTTP server for '%s' listening on :%d", serviceName, port)
+		logger.Logger.Info().Msgf("✅ HTTP server for '%s' listening on :%d", serviceName, port)
 		if err := app.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("http server error for '%s': %w", serviceName, err)
 		}
@@ -142,18 +151,20 @@ func (app *Application) AddServer(mux *http.ServeMux, port int) error {
 
 	app.g.Go(func() error {
 		<-app.shutdownCtx.Done() // 等待关停信号
-		logger.Logger.Printf("Shutting down HTTP server for '%s'...", serviceName)
+		logger.Logger.Info().Msgf("Shutting down HTTP server for '%s'...", serviceName)
 
 		// 创建一个有超时的上下文用于关停
 		shutdownTimeoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// 先从 Nacos 注销
-		if err := app.nacosNaming.DeregisterServiceInstance(serviceName, ip, port); err != nil {
-			logger.Logger.Fatal().Msgf("❌ Error deregistering '%s' from Nacos: %v", serviceName, err)
-			// 即使注销失败，也要继续关闭服务器，但记录错误
-		} else {
-			logger.Logger.Printf("✅ Service '%s' deregistered from Nacos.", serviceName)
+		// 先从 Nacos 注销 (如果 Nacos 启用)
+		if app.nacosNaming != nil {
+			if err := app.nacosNaming.DeregisterServiceInstance(serviceName, ip, port); err != nil {
+				// 在关停阶段只记录错误，不中断流程
+				logger.Logger.Error().Err(err).Msgf("❌ Error deregistering '%s' from Nacos", serviceName)
+			} else {
+				logger.Logger.Info().Msgf("✅ Service '%s' deregistered from Nacos.", serviceName)
+			}
 		}
 
 		// 再关闭 HTTP 服务器
@@ -176,7 +187,7 @@ func (app *Application) AddTask(start func(ctx context.Context) error, stop func
 	if stop != nil {
 		app.g.Go(func() error {
 			<-app.shutdownCtx.Done() // 等待关停信号
-			logger.Logger.Println("Stopping background task...")
+			logger.Logger.Info().Msg("Stopping background task...")
 			// 为关停操作也设置一个超时
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -187,19 +198,28 @@ func (app *Application) AddTask(start func(ctx context.Context) error, stop func
 
 // addCoreShutdownTasks 注册核心基础设施组件的关停任务。
 func (app *Application) addCoreShutdownTasks() {
+	// 注册 Nacos 客户端的关闭任务
+	if app.nacosConfig != nil || app.nacosNaming != nil {
+		app.AddTask(nil, func(ctx context.Context) error {
+			logger.Logger.Info().Msg("Closing Nacos clients...")
+			if app.nacosConfig != nil {
+				app.nacosConfig.Close()
+			}
+			if app.nacosNaming != nil {
+				app.nacosNaming.Close()
+			}
+			logger.Logger.Info().Msg("✅ Nacos clients closed.")
+			return nil
+		})
+	}
+
+	// 注册 Tracer Provider 的关闭任务
 	app.AddTask(nil, func(ctx context.Context) error {
-		logger.Logger.Printf("Closing Nacos clients...")
-		nacosConfigClient.CloseClient()
-		app.nacosNaming.Close()
-		logger.Logger.Printf("✅ Nacos clients closed.")
-		return nil
-	})
-	app.AddTask(nil, func(ctx context.Context) error {
-		logger.Logger.Printf("Shutting down tracer provider...")
+		logger.Logger.Info().Msg("Shutting down tracer provider...")
 		if err := app.tracer.Shutdown(ctx); err != nil {
 			return err
 		}
-		logger.Logger.Printf("✅ Tracer provider shut down.")
+		logger.Logger.Info().Msg("✅ Tracer provider shut down.")
 		return nil
 	})
 }
@@ -215,21 +235,21 @@ func (app *Application) Run() error {
 		case <-app.shutdownCtx.Done():
 			return nil // 由其他任务触发的关停
 		case sig := <-quit:
-			logger.Logger.Printf("Received signal '%v', initiating graceful shutdown...", sig)
+			logger.Logger.Info().Msgf("Received signal '%v', initiating graceful shutdown...", sig)
 			app.shutdownCancel() // 触发所有任务的关停
 		}
 		return nil
 	})
 
 	serviceName := app.serviceName
-	logger.Logger.Printf("🚀 Application '%s' started. Waiting for tasks to complete or shutdown signal...", serviceName)
+	logger.Logger.Info().Msgf("🚀 Application '%s' started. Waiting for tasks to complete or shutdown signal...", serviceName)
 
 	// 等待所有由 errgroup 管理的 goroutine 完成
 	if err := app.g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Logger.Error().Msgf("❌ Application run failed with error: %v", err)
+		logger.Logger.Error().Err(err).Msgf("❌ Application run failed with error: %v", err)
 		return err
 	}
 
-	logger.Logger.Printf("✅ Application '%s' gracefully shut down.", app.serviceName)
+	logger.Logger.Info().Msgf("✅ Application '%s' gracefully shut down.", app.serviceName)
 	return nil
 }
